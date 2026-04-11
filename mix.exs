@@ -51,7 +51,10 @@ defmodule GenAgentClaude.MixProject do
   defp package do
     [
       licenses: ["MIT"],
-      links: %{"GitHub" => @source_url},
+      links: %{
+        "GitHub" => @source_url,
+        "Changelog" => "#{@source_url}/blob/main/CHANGELOG.md"
+      },
       files: ~w(lib mix.exs README.md CHANGELOG.md LICENSE .formatter.exs),
       maintainers: ["Josh Rotenberg"]
     ]
