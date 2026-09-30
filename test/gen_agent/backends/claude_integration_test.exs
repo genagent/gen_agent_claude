@@ -21,7 +21,7 @@ defmodule GenAgent.Backends.ClaudeIntegrationTest do
     use GenAgent
 
     defmodule State do
-      defstruct responses: []
+      defstruct responses: [], errors: [], stream_events: []
     end
 
     @impl true
@@ -33,6 +33,16 @@ defmodule GenAgent.Backends.ClaudeIntegrationTest do
     @impl true
     def handle_response(_ref, response, %State{} = state) do
       {:noreply, %{state | responses: state.responses ++ [response]}}
+    end
+
+    @impl true
+    def handle_error(_ref, reason, %State{} = state) do
+      {:noreply, %{state | errors: state.errors ++ [reason]}}
+    end
+
+    @impl true
+    def handle_stream_event(event, %State{} = state) do
+      %{state | stream_events: state.stream_events ++ [event]}
     end
   end
 
@@ -159,6 +169,66 @@ defmodule GenAgent.Backends.ClaudeIntegrationTest do
       name = start_claude_agent(stream_fn)
 
       assert {:error, "rate limited"} = GenAgent.ask(name, "boom")
+    end
+
+    test "failed Claude result reaches handle_error for ask and poll" do
+      failure =
+        stream_event("result", %{
+          "subtype" => "error_max_turns",
+          "is_error" => true,
+          "result" => "Turn limit reached",
+          "session_id" => "s-failed",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 1}
+        })
+
+      name = start_claude_agent(fn _prompt, _opts -> [failure] end)
+
+      assert {:error, %{subtype: "error_max_turns", session_id: "s-failed"}} =
+               GenAgent.ask(name, "first")
+
+      {:ok, ref} = GenAgent.tell(name, "second")
+
+      result =
+        Enum.reduce_while(1..100, nil, fn _, _ ->
+          case GenAgent.poll(name, ref) do
+            {:ok, :pending} ->
+              Process.sleep(10)
+              {:cont, nil}
+
+            result ->
+              {:halt, result}
+          end
+        end)
+
+      assert {:error, %{subtype: "error_max_turns"}} = result
+
+      state = GenAgent.status(name).agent_state
+      assert length(state.errors) == 2
+      assert state.responses == []
+    end
+
+    test "parsed partial text and MCP call/return reach stream callbacks once" do
+      lines = [
+        ~s({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Found it"}}}),
+        ~s({"type":"assistant","message":{"content":[{"type":"text","text":"Found it"},{"type":"tool_use","id":"call-1","name":"mcp__fixture__read","input":{"path":"README.md"}}]}}),
+        ~s({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"call-1","content":"contents","is_error":false}]}}),
+        ~s({"type":"result","result":"Found it","session_id":"s-1"})
+      ]
+
+      stream_fn = fn _prompt, _opts ->
+        Enum.map(lines, fn line ->
+          {:ok, event} = StreamEvent.parse(line)
+          event
+        end)
+      end
+
+      name = start_claude_agent(stream_fn)
+      assert {:ok, response} = GenAgent.ask(name, "read")
+      assert response.text == "Found it"
+      assert Enum.map(response.events, & &1.kind) == [:text, :tool_use, :tool_result, :result]
+
+      assert Enum.map(GenAgent.status(name).agent_state.stream_events, & &1.kind) ==
+               [:text, :tool_use, :tool_result, :result]
     end
   end
 end

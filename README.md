@@ -93,7 +93,8 @@ required.
 **Query:**
 - `:model`, `:system_prompt`, `:append_system_prompt`, `:max_turns`,
   `:max_budget_usd`, `:permission_mode`, `:dangerously_skip_permissions`,
-  `:effort`, `:json_schema`, `:agent`, `:brief`
+  `:effort`, `:json_schema`, `:agent`, `:brief`,
+  `:include_partial_messages` (enabled by default)
 
 **Backend-only:**
 - `:stream_fn` -- a 2-arity function `(prompt, opts) -> Enumerable.t()`
@@ -110,16 +111,23 @@ values by `GenAgent.Backends.Claude.EventTranslator`:
 | Claude event | GenAgent event |
 |---|---|
 | `"system"` | filtered |
-| `"assistant"` | `:text` (from text content blocks) |
+| `"assistant"` | `:text` and `:tool_use` from ordered content blocks |
+| `"user"` | `:tool_result` from tool-result content blocks |
+| `"stream_event"` with text delta | immediate `:text`; completed assistant text is deduplicated |
 | `"content_block_delta"` | `:text` (from delta text) |
 | `"tool_use"` | `:tool_use` |
 | `"tool_result"` | `:tool_result` |
-| `"result"` | `:usage` + terminal `:result` |
+| successful `"result"` | `:usage` + terminal `:result` |
+| failed `"result"` | `:usage` + terminal `:error` with subtype, message, cost, session and usage evidence |
 | `"error"` | terminal `:error` |
 | anything else | filtered |
 
 Token counts from `data["usage"]` are pulled out into a separate
 `:usage` event so `GenAgent.Response.usage` is populated.
+Failed results reach `handle_error/3` and return `{:error, reason}` from
+`ask/3` or `poll/3`. They are not retried automatically. Tool calls
+are emitted from completed assistant blocks so full input is retained;
+partial tool-input JSON is not emitted on its own.
 
 ## Testing
 
