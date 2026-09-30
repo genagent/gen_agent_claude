@@ -30,6 +30,12 @@ defmodule GenAgent.Backends.Claude do
   `:result` event arrives, `update_session/2` captures `session_id`
   from the event data and stores it on the session struct. Subsequent
   turns pass that id through Claude's `--resume` flag.
+
+  `terminate_session/1` has no native process to close. GenAgent cancels
+  its prompt task on interrupt, watchdog, stop, or agent death, but the
+  default Port runner closes pipes without guaranteeing that the CLI and
+  its subprocesses have exited. Choose a runner with process-group
+  termination when OS-level settlement is required.
   """
 
   @behaviour GenAgent.Backend

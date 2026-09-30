@@ -86,7 +86,8 @@ defmodule GenAgent.Backends.ClaudeExecutableConformanceTest do
         model: "fixture-model",
         system_prompt: "fixture system",
         max_turns: 2,
-        permission_mode: :plan
+        permission_mode: :plan,
+        env: [{"GEN_AGENT_FIXTURE", "configured"}]
       )
 
     assert {:ok, first} = GenAgent.ask(name, "first prompt")
@@ -119,6 +120,8 @@ defmodule GenAgent.Backends.ClaudeExecutableConformanceTest do
              |> String.trim()
              |> Path.basename()
 
+    assert File.read!(Path.join(context.directory, "fresh.env")) == "configured\n"
+
     assert {:ok, second} = GenAgent.ask(name, "follow-up prompt")
     assert second.session_id == "fixture-session"
     resume_args = args(context.directory, :resume)
@@ -126,6 +129,8 @@ defmodule GenAgent.Backends.ClaudeExecutableConformanceTest do
 
     assert Enum.chunk_every(resume_args, 2, 1, :discard)
            |> Enum.member?(["--resume", "fixture-session"])
+
+    assert File.read!(Path.join(context.directory, "resume.env")) == "configured\n"
   end
 
   test "typed CLI failure and truncated stream reach GenAgent as errors", context do
