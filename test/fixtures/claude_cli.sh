@@ -8,6 +8,7 @@ for arg in "$@"; do
 done
 printf '%s\n' "$@" > "$fixture_dir/$mode.args"
 pwd > "$fixture_dir/$mode.cwd"
+printf '%s\n' "${GEN_AGENT_FIXTURE-unset}" > "$fixture_dir/$mode.env"
 
 case "$*" in
   *fail*)
