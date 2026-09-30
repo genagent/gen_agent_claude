@@ -15,18 +15,20 @@ defmodule GenAgent.Backends.Claude.EventTranslator do
   ## Translation rules
 
     * `"system"` -- filtered out (no GenAgent events).
-    * `"assistant"` -- any text content blocks become a single `:text` event
-      carrying the concatenated text. An assistant message with no text
-      content is filtered out.
+    * `"assistant"` -- ordered text and tool-use content blocks become
+      `:text` and `:tool_use` events. Adjacent text blocks are joined.
+    * `"user"` -- tool-result content blocks become `:tool_result` events.
+    * `"stream_event"` -- wrapped text deltas become immediate `:text`
+      events. A later completed assistant message contributes only text
+      that was not already streamed.
     * `"content_block_delta"` -- emits a `:text` event with the delta's text.
     * `"tool_use"` -- emits a `:tool_use` event carrying the raw data map.
     * `"tool_result"` -- emits a `:tool_result` event carrying the raw data map.
-    * `"result"` -- emits a `:usage` event (if token counts are present
-      under `data["usage"]`) followed by a terminal `:result` event with
-      `:text`, `:session_id`, and any additional Claude-specific
-      metadata (`cost_usd`, `duration_ms`, `num_turns`, `is_error`)
-      passed through in `:data`. Claude reports cost as `total_cost_usd`;
-      we normalize it to `:cost_usd`.
+    * `"result"` -- emits `:usage` when token counts are present, then
+      terminal `:result` on success or `:error` when `is_error` or an
+      error subtype is reported. Failure reason keeps subtype, message,
+      session ID, cost and usage. Claude reports cost as
+      `total_cost_usd`; we normalize it to `:cost_usd`.
     * `"error"` -- emits a terminal `:error` event with `:reason` extracted
       from `data["error"]` or `data["message"]`.
     * Unknown types -- filtered out.
@@ -42,9 +44,17 @@ defmodule GenAgent.Backends.Claude.EventTranslator do
   def translate(%StreamEvent{type: "system"}), do: []
 
   def translate(%StreamEvent{type: "assistant", data: data}) do
-    case extract_assistant_text(data) do
-      "" -> []
-      text -> [Event.new(:text, %{text: text})]
+    content_events(data)
+  end
+
+  def translate(%StreamEvent{type: "user", data: data}) do
+    data |> content_events() |> Enum.filter(&(&1.kind == :tool_result))
+  end
+
+  def translate(%StreamEvent{type: "stream_event"} = event) do
+    case StreamEvent.partial_message(event) do
+      {:block_delta, _index, {:text, text}} -> [Event.new(:text, %{text: text})]
+      _ -> []
     end
   end
 
@@ -63,26 +73,7 @@ defmodule GenAgent.Backends.Claude.EventTranslator do
     [Event.new(:tool_result, data)]
   end
 
-  def translate(%StreamEvent{type: "result", data: data}) do
-    usage_event =
-      case extract_usage(data) do
-        nil -> []
-        usage -> [Event.new(:usage, usage)]
-      end
-
-    event_data =
-      %{
-        text: data["result"] || "",
-        session_id: data["session_id"],
-        cost_usd: data["total_cost_usd"] || data["cost_usd"],
-        duration_ms: data["duration_ms"],
-        num_turns: data["num_turns"],
-        is_error: data["is_error"] || false
-      }
-      |> drop_nil_values()
-
-    usage_event ++ [Event.new(:result, event_data)]
-  end
+  def translate(%StreamEvent{type: "result", data: data}), do: result_events(data)
 
   def translate(%StreamEvent{type: "error", data: data}) do
     reason = data["error"] || data["message"] || :unknown
@@ -91,35 +82,151 @@ defmodule GenAgent.Backends.Claude.EventTranslator do
 
   def translate(%StreamEvent{}), do: []
 
+  defp result_events(data) do
+    usage_event =
+      case extract_usage(data) do
+        nil -> []
+        usage -> [Event.new(:usage, usage)]
+      end
+
+    terminal =
+      if failed_result?(data), do: error_result_event(data), else: success_result_event(data)
+
+    usage_event ++ [terminal]
+  end
+
+  defp success_result_event(data) do
+    event_data = %{
+      text: data["result"] || "",
+      session_id: data["session_id"],
+      cost_usd: data["total_cost_usd"] || data["cost_usd"],
+      duration_ms: data["duration_ms"],
+      num_turns: data["num_turns"],
+      is_error: data["is_error"] || false
+    }
+
+    Event.new(:result, drop_nil_values(event_data))
+  end
+
+  defp error_result_event(data) do
+    reason = %{
+      provider: :claude,
+      subtype: data["subtype"],
+      message: data["result"] || data["error"] || :unknown,
+      session_id: data["session_id"],
+      cost_usd: data["total_cost_usd"] || data["cost_usd"],
+      usage: extract_usage(data)
+    }
+
+    Event.new(:error, %{reason: drop_nil_values(reason), data: data})
+  end
+
   @doc """
   Translate an enumerable of `StreamEvent` values into an enumerable of
   `GenAgent.Event` values, flattening empty translations.
   """
   @spec translate_stream(Enumerable.t()) :: Enumerable.t()
   def translate_stream(stream) do
-    Stream.flat_map(stream, &translate/1)
+    Stream.transform(stream, %{partial_text: "", seen_calls: MapSet.new()}, fn raw, state ->
+      events = translate(raw)
+
+      events =
+        if raw.type == "assistant" and state.partial_text != "" do
+          drop_streamed_text(events, state.partial_text)
+        else
+          events
+        end
+
+      {events, seen_calls} = dedupe_calls(events, state.seen_calls)
+
+      partial_text =
+        case StreamEvent.partial_message(raw) do
+          {:block_delta, _index, {:text, text}} -> state.partial_text <> text
+          _ when raw.type == "assistant" -> ""
+          _ -> state.partial_text
+        end
+
+      {events, %{partial_text: partial_text, seen_calls: seen_calls}}
+    end)
   end
 
   # ---------------------------------------------------------------------------
   # Helpers
   # ---------------------------------------------------------------------------
 
-  defp extract_assistant_text(%{"message" => %{} = message}) do
-    extract_assistant_text(message)
+  defp content_events(%{"message" => %{} = message}), do: content_events(message)
+
+  defp content_events(%{"content" => content}) when is_list(content) do
+    {events, text} =
+      Enum.reduce(content, {[], ""}, fn
+        %{"type" => "tool_use"} = block, {events, text} ->
+          {events ++ text_event(text) ++ [Event.new(:tool_use, block)], ""}
+
+        %{"type" => "tool_result"} = block, {events, text} ->
+          {events ++ text_event(text) ++ [Event.new(:tool_result, block)], ""}
+
+        %{"text" => part}, {events, text} when is_binary(part) ->
+          {events, text <> part}
+
+        _block, acc ->
+          acc
+      end)
+
+    events ++ text_event(text)
   end
 
-  defp extract_assistant_text(%{"content" => content}) when is_list(content) do
-    content
-    |> Enum.map_join("", fn
-      %{"text" => text} when is_binary(text) -> text
-      %{"type" => "text", "text" => text} when is_binary(text) -> text
-      _ -> ""
+  defp content_events(%{"content" => content}) when is_binary(content),
+    do: [Event.new(:text, %{text: content})]
+
+  defp content_events(_), do: []
+
+  defp text_event(""), do: []
+  defp text_event(text), do: [Event.new(:text, %{text: text})]
+
+  defp failed_result?(data) do
+    subtype = data["subtype"]
+
+    data["is_error"] == true or
+      (is_binary(subtype) and (subtype == "error" or String.starts_with?(subtype, "error_")))
+  end
+
+  defp drop_streamed_text(events, partial_text) do
+    {kept, _remaining} =
+      Enum.reduce(events, {[], partial_text}, fn
+        %Event{kind: :text, data: %{text: text}} = event, {kept, remaining}
+        when remaining != "" ->
+          cond do
+            String.starts_with?(remaining, text) ->
+              {kept, String.replace_prefix(remaining, text, "")}
+
+            String.starts_with?(text, remaining) ->
+              rest = String.replace_prefix(text, remaining, "")
+              {kept ++ text_event(rest), ""}
+
+            true ->
+              {kept ++ [event], ""}
+          end
+
+        event, {kept, remaining} ->
+          {kept ++ [event], remaining}
+      end)
+
+    kept
+  end
+
+  defp dedupe_calls(events, seen_calls) do
+    Enum.reduce(events, {[], seen_calls}, fn event, {kept, seen} ->
+      id = event.data["id"] || event.data["tool_use_id"]
+      key = {event.kind, id}
+
+      if event.kind in [:tool_use, :tool_result] and is_binary(id) and MapSet.member?(seen, key) do
+        {kept, seen}
+      else
+        {[event | kept], if(is_binary(id), do: MapSet.put(seen, key), else: seen)}
+      end
     end)
+    |> then(fn {kept, seen} -> {Enum.reverse(kept), seen} end)
   end
-
-  defp extract_assistant_text(%{"content" => content}) when is_binary(content), do: content
-
-  defp extract_assistant_text(_), do: ""
 
   defp drop_nil_values(map) do
     map

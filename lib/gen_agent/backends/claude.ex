@@ -16,7 +16,7 @@ defmodule GenAgent.Backends.Claude do
     * Query: `:model`, `:system_prompt`, `:append_system_prompt`,
       `:max_turns`, `:max_budget_usd`, `:permission_mode`,
       `:dangerously_skip_permissions`, `:effort`, `:json_schema`,
-      `:agent`, `:brief`
+      `:agent`, `:brief`, `:include_partial_messages` (on by default)
 
   Plus a backend-only option:
 
@@ -94,6 +94,8 @@ defmodule GenAgent.Backends.Claude do
   # ---------------------------------------------------------------------------
 
   defp normalize_opts(opts) do
+    opts = Keyword.put_new(opts, :include_partial_messages, true)
+
     case Keyword.pop(opts, :cwd) do
       {nil, rest} -> rest
       {cwd, rest} -> Keyword.put_new(rest, :working_dir, cwd)

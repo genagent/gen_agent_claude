@@ -46,8 +46,8 @@ defmodule GenAgent.Backends.Claude.EventTranslatorTest do
                EventTranslator.translate(event)
     end
 
-    test "with no text content is filtered out" do
-      event = stream_event("assistant", %{"content" => [%{"type" => "tool_use"}]})
+    test "with no text or tool content is filtered out" do
+      event = stream_event("assistant", %{"content" => [%{"type" => "image"}]})
       assert EventTranslator.translate(event) == []
     end
   end
@@ -193,5 +193,61 @@ defmodule GenAgent.Backends.Claude.EventTranslatorTest do
 
       assert Enum.map(outputs, & &1.kind) == [:text, :tool_use, :result]
     end
+
+    test "parses nested tool calls and returns while avoiding streamed text duplication" do
+      lines = [
+        ~s({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}}),
+        ~s({"type":"assistant","message":{"content":[{"type":"text","text":"Hello"},{"type":"tool_use","id":"call-1","name":"mcp__fixture__read","input":{"path":"README.md"}},{"type":"text","text":" world"}]}}),
+        ~s({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"call-1","content":"ok","is_error":false}]}}),
+        ~s({"type":"result","result":"Hello world","session_id":"s-1","usage":{"input_tokens":2,"output_tokens":3}})
+      ]
+
+      events =
+        lines
+        |> Enum.map(fn line ->
+          {:ok, event} = StreamEvent.parse(line)
+          event
+        end)
+        |> EventTranslator.translate_stream()
+        |> Enum.to_list()
+
+      assert Enum.map(events, & &1.kind) == [
+               :text,
+               :tool_use,
+               :text,
+               :tool_result,
+               :usage,
+               :result
+             ]
+
+      assert Enum.at(events, 0).data.text == "Hello"
+      assert Enum.at(events, 1).data["input"] == %{"path" => "README.md"}
+      assert Enum.at(events, 2).data.text == " world"
+      assert Enum.at(events, 3).data["tool_use_id"] == "call-1"
+    end
+  end
+
+  test "failed result envelope is terminal error with subtype and usage" do
+    {:ok, event} =
+      StreamEvent.parse(
+        ~s({"type":"result","subtype":"error_max_turns","is_error":true,"result":"Turn limit reached","session_id":"s-2","total_cost_usd":0.02,"usage":{"input_tokens":10,"output_tokens":1}})
+      )
+
+    assert [
+             %Event{kind: :usage, data: %{input_tokens: 10}},
+             %Event{kind: :error, data: %{reason: reason}}
+           ] = EventTranslator.translate(event)
+
+    assert reason.subtype == "error_max_turns"
+    assert reason.message == "Turn limit reached"
+    assert reason.session_id == "s-2"
+    assert reason.cost_usd == 0.02
+  end
+
+  test "failure subtype remains an error even if is_error is absent" do
+    assert [%Event{kind: :error}] =
+             EventTranslator.translate(
+               stream_event("result", %{"subtype" => "error_max_budget_usd"})
+             )
   end
 end
