@@ -22,7 +22,7 @@ for install instructions.
 ```elixir
 def deps do
   [
-    {:gen_agent, "~> 0.2.0"},
+    {:gen_agent, "~> 0.3.0"},
     {:gen_agent_claude, "~> 0.1.0"}
   ]
 end
